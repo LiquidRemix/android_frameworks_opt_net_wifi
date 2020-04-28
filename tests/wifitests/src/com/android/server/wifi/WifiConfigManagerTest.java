@@ -42,6 +42,7 @@ import android.os.Process;
 import android.os.UserHandle;
 import android.os.UserManager;
 import android.os.test.TestLooper;
+import android.provider.DeviceConfig.OnPropertiesChangedListener;
 import android.provider.Settings;
 import android.telephony.TelephonyManager;
 import android.text.TextUtils;
@@ -63,12 +64,14 @@ import org.mockito.InOrder;
 import org.mockito.Mock;
 import org.mockito.MockitoAnnotations;
 import org.mockito.MockitoSession;
+import org.mockito.quality.Strictness;
 
 import java.io.FileDescriptor;
 import java.io.PrintWriter;
 import java.io.StringWriter;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -111,6 +114,8 @@ public class WifiConfigManagerTest {
     private static final int TEST_FREQUENCY_1 = 2412;
     private static final int TEST_FREQUENCY_2 = 5180;
     private static final int TEST_FREQUENCY_3 = 5240;
+    private static final MacAddress TEST_RANDOMIZED_MAC =
+            MacAddress.fromString("d2:11:19:34:a5:20");
 
     @Mock private Context mContext;
     @Mock private Clock mClock;
@@ -132,7 +137,11 @@ public class WifiConfigManagerTest {
     @Mock private WifiConfigManager.OnSavedNetworkUpdateListener mWcmListener;
     @Mock private FrameworkFacade mFrameworkFacade;
     @Mock private CarrierNetworkConfig mCarrierNetworkConfig;
+    @Mock private MacAddressUtil mMacAddressUtil;
+    @Mock DeviceConfigFacade mDeviceConfigFacade;
 
+    final ArgumentCaptor<OnPropertiesChangedListener> mOnPropertiesChangedListenerCaptor =
+            ArgumentCaptor.forClass(OnPropertiesChangedListener.class);
     private MockResources mResources;
     private InOrder mContextConfigStoreMockOrder;
     private InOrder mNetworkListStoreDataMockOrder;
@@ -164,7 +173,10 @@ public class WifiConfigManagerTest {
         mResources.setInteger(
                 R.integer.config_wifi_framework_associated_partial_scan_max_num_active_channels,
                 TEST_MAX_NUM_ACTIVE_CHANNELS_FOR_PARTIAL_SCAN);
+        mResources.setBoolean(R.bool.config_wifi_connected_mac_randomization_supported, true);
         when(mContext.getResources()).thenReturn(mResources);
+        when(mDeviceConfigFacade.getRandomizationFlakySsidHotlist()).thenReturn(
+                Collections.emptySet());
 
         // Setup UserManager profiles for the default user.
         setupUserProfiles(TEST_DEFAULT_USER);
@@ -212,6 +224,10 @@ public class WifiConfigManagerTest {
         when(mWifiInjector.getWifiLastResortWatchdog().shouldIgnoreSsidUpdate())
                 .thenReturn(false);
         when(mWifiInjector.getCarrierNetworkConfig()).thenReturn(mCarrierNetworkConfig);
+        when(mWifiInjector.getMacAddressUtil()).thenReturn(mMacAddressUtil);
+        when(mMacAddressUtil.calculatePersistentMacForConfiguration(any(), any()))
+                .thenReturn(TEST_RANDOMIZED_MAC);
+
         createWifiConfigManager();
         mWifiConfigManager.setOnSavedNetworkUpdateListener(mWcmListener);
         ArgumentCaptor<ContentObserver> observerCaptor =
@@ -227,9 +243,12 @@ public class WifiConfigManagerTest {
         // static mocking
         mSession = ExtendedMockito.mockitoSession()
                 .mockStatic(WifiConfigStore.class, withSettings().lenient())
+                .strictness(Strictness.LENIENT)
                 .startMocking();
-        when(WifiConfigStore.createUserFiles(anyInt())).thenReturn(mock(List.class));
+        when(WifiConfigStore.createUserFiles(anyInt(), anyBoolean())).thenReturn(mock(List.class));
         when(mTelephonyManager.createForSubscriptionId(anyInt())).thenReturn(mDataTelephonyManager);
+        verify(mDeviceConfigFacade).addOnPropertiesChangedListener(any(),
+                mOnPropertiesChangedListenerCaptor.capture());
     }
 
     /**
@@ -238,7 +257,9 @@ public class WifiConfigManagerTest {
     @After
     public void cleanup() {
         validateMockitoUsage();
-        mSession.finishMocking();
+        if (mSession != null) {
+            mSession.finishMocking();
+        }
     }
 
     /**
@@ -279,6 +300,30 @@ public class WifiConfigManagerTest {
 
         assertTrue(mWifiConfigManager.saveToStore(true));
         mContextConfigStoreMockOrder.verify(mWifiConfigStore).write(anyBoolean());
+    }
+
+    /**
+     * Verify that a randomized MAC address is generated even if the KeyStore operation fails.
+     */
+    @Test
+    public void testRandomizedMacIsGeneratedEvenIfKeyStoreFails() {
+        when(mMacAddressUtil.calculatePersistentMacForConfiguration(any(), any())).thenReturn(null);
+
+        // Try adding a network.
+        WifiConfiguration openNetwork = WifiConfigurationTestUtil.createOpenNetwork();
+        List<WifiConfiguration> networks = new ArrayList<>();
+        networks.add(openNetwork);
+        verifyAddNetworkToWifiConfigManager(openNetwork);
+        List<WifiConfiguration> retrievedNetworks =
+                mWifiConfigManager.getConfiguredNetworksWithPasswords();
+
+        // Verify that we have attempted to generate the MAC address twice (1 retry)
+        verify(mMacAddressUtil, times(2)).calculatePersistentMacForConfiguration(any(), any());
+        assertEquals(1, retrievedNetworks.size());
+
+        // Verify that despite KeyStore returning null, we are still getting a valid MAC address.
+        assertNotEquals(WifiInfo.DEFAULT_MAC_ADDRESS,
+                retrievedNetworks.get(0).getRandomizedMacAddress().toString());
     }
 
     /**
@@ -367,6 +412,7 @@ public class WifiConfigManagerTest {
      */
     @Test
     public void testAddingNetworkWithMatchingMacAddressOverridesField() {
+        int prevMappingSize = mWifiConfigManager.getRandomizedMacAddressMappingSize();
         WifiConfiguration openNetwork = WifiConfigurationTestUtil.createOpenNetwork();
         Map<String, String> randomizedMacAddressMapping = new HashMap<>();
         final String randMac = "12:23:34:45:56:67";
@@ -381,6 +427,9 @@ public class WifiConfigManagerTest {
         List<WifiConfiguration> retrievedNetworks =
                 mWifiConfigManager.getConfiguredNetworksWithPasswords();
         assertEquals(randMac, retrievedNetworks.get(0).getRandomizedMacAddress().toString());
+        // Verify that for networks that we already have randomizedMacAddressMapping saved
+        // we are still correctly writing into the WifiConfigStore.
+        assertEquals(prevMappingSize + 1, mWifiConfigManager.getRandomizedMacAddressMappingSize());
     }
 
     /**
@@ -390,6 +439,7 @@ public class WifiConfigManagerTest {
      */
     @Test
     public void testRandomizedMacAddressIsPersistedOverForgetNetwork() {
+        int prevMappingSize = mWifiConfigManager.getRandomizedMacAddressMappingSize();
         // Create and add an open network
         WifiConfiguration openNetwork = WifiConfigurationTestUtil.createOpenNetwork();
         verifyAddNetworkToWifiConfigManager(openNetwork);
@@ -409,6 +459,8 @@ public class WifiConfigManagerTest {
         verifyAddNetworkToWifiConfigManager(openNetwork);
         retrievedNetworks = mWifiConfigManager.getConfiguredNetworksWithPasswords();
         assertEquals(randMac, retrievedNetworks.get(0).getRandomizedMacAddress().toString());
+        // Verify that we are no longer persisting the randomized MAC address with WifiConfigStore.
+        assertEquals(prevMappingSize, mWifiConfigManager.getRandomizedMacAddressMappingSize());
     }
 
     /**
@@ -1937,6 +1989,44 @@ public class WifiConfigManagerTest {
         configWithRandomizedMac = mWifiConfigManager
                 .getConfiguredNetworkWithoutMasking(result.getNetworkId());
         assertEquals(testMac, configWithRandomizedMac.getRandomizedMacAddress());
+    }
+
+    /**
+     * Verifies that macRandomizationSetting is not masked out when MAC randomization is supported.
+     */
+    @Test
+    public void testGetConfiguredNetworksNotMaskMacRandomizationSetting() {
+        WifiConfiguration config = WifiConfigurationTestUtil.createOpenNetwork();
+        NetworkUpdateResult result = verifyAddNetworkToWifiConfigManager(config);
+
+        MacAddress testMac = MacAddress.createRandomUnicastAddress();
+        mWifiConfigManager.setNetworkRandomizedMacAddress(result.getNetworkId(), testMac);
+
+        // Verify macRandomizationSetting is not masked out when feature is supported.
+        List<WifiConfiguration> configs = mWifiConfigManager.getSavedNetworks(Process.WIFI_UID);
+        assertEquals(1, configs.size());
+        assertEquals(WifiConfiguration.RANDOMIZATION_PERSISTENT,
+                configs.get(0).macRandomizationSetting);
+    }
+
+    /**
+     * Verifies that macRandomizationSetting is masked out to WifiConfiguration.RANDOMIZATION_NONE
+     * when MAC randomization is not supported on the device.
+     */
+    @Test
+    public void testGetConfiguredNetworksMasksMacRandomizationSetting() {
+        mResources.setBoolean(R.bool.config_wifi_connected_mac_randomization_supported, false);
+        createWifiConfigManager();
+        WifiConfiguration config = WifiConfigurationTestUtil.createOpenNetwork();
+        NetworkUpdateResult result = verifyAddNetworkToWifiConfigManager(config);
+
+        MacAddress testMac = MacAddress.createRandomUnicastAddress();
+        mWifiConfigManager.setNetworkRandomizedMacAddress(result.getNetworkId(), testMac);
+
+        // Verify macRandomizationSetting is masked out when feature is unsupported.
+        List<WifiConfiguration> configs = mWifiConfigManager.getSavedNetworks(Process.WIFI_UID);
+        assertEquals(1, configs.size());
+        assertEquals(WifiConfiguration.RANDOMIZATION_NONE, configs.get(0).macRandomizationSetting);
     }
 
     /**
@@ -4565,7 +4655,7 @@ public class WifiConfigManagerTest {
                         mWifiPermissionsUtil, mWifiPermissionsWrapper, mWifiInjector,
                         mNetworkListSharedStoreData, mNetworkListUserStoreData,
                         mDeletedEphemeralSsidsStoreData, mRandomizedMacStoreData,
-                        mFrameworkFacade, mLooper.getLooper());
+                        mFrameworkFacade, mLooper.getLooper(), mDeviceConfigFacade);
         mWifiConfigManager.enableVerboseLogging(1);
     }
 
@@ -5293,5 +5383,33 @@ public class WifiConfigManagerTest {
 
         assertFalse(mWifiConfigManager.getConfiguredNetwork(networkId)
                     .getNetworkSelectionStatus().isNetworkTemporaryDisabled());
+    }
+
+    /**
+     * Verifies that isInFlakyRandomizationSsidHotlist returns true if the network's SSID is in
+     * the hotlist and the network is using randomized MAC.
+     */
+    @Test
+    public void testFlakyRandomizationSsidHotlist() {
+        WifiConfiguration openNetwork = WifiConfigurationTestUtil.createOpenNetwork();
+        NetworkUpdateResult result = verifyAddNetworkToWifiConfigManager(openNetwork);
+        int networkId = result.getNetworkId();
+
+        // should return false when there is nothing in the hotlist
+        assertFalse(mWifiConfigManager.isInFlakyRandomizationSsidHotlist(networkId));
+
+        // add the network's SSID to the hotlist and verify the method returns true
+        Set<String> ssidHotlist = new HashSet<>();
+        ssidHotlist.add(openNetwork.SSID);
+        when(mDeviceConfigFacade.getRandomizationFlakySsidHotlist()).thenReturn(ssidHotlist);
+        mOnPropertiesChangedListenerCaptor.getValue().onPropertiesChanged(null);
+        assertTrue(mWifiConfigManager.isInFlakyRandomizationSsidHotlist(networkId));
+
+        // Now change the macRandomizationSetting to "trusted" and then verify
+        // isInFlakyRandomizationSsidHotlist returns false
+        openNetwork.macRandomizationSetting = WifiConfiguration.RANDOMIZATION_NONE;
+        NetworkUpdateResult networkUpdateResult = updateNetworkToWifiConfigManager(openNetwork);
+        assertNotEquals(WifiConfiguration.INVALID_NETWORK_ID, networkUpdateResult.getNetworkId());
+        assertFalse(mWifiConfigManager.isInFlakyRandomizationSsidHotlist(networkId));
     }
 }
